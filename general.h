@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 
 #include "log.h"

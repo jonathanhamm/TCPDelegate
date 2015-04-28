@@ -4,6 +4,7 @@
 
 #include "general.h"
 
+#define MAX_CLIENTS 20
 #define DEFAULT_PORT 13370
 
 extern void server_start(uint16_t port);
