@@ -19,15 +19,17 @@ typedef struct request_s request_s;
 
 enum pack_type_e {
     PACKET_OPEN = 1,
-    PACKET_TX_SERVER = 2,
-    PACKET_TX_CLIENT = 3,
-    PACKET_CLOSE = 4,
-    PACKET_SQL_QUERY = 5
-};
+    PACKET_CLOSE,
+    PACKET_TX_SERVER,
+    PACKET_TX_CLIENT,
+    PACKET_SQL_QUERY,
+    PACKET_TARGETINFO};
 
 struct request_s {
     int fd;
     bool isactive;
+    struct sockaddr_in client_ip;
+    char ipstr[INET_ADDRSTRLEN];
     pthread_t thread;
 };
 
@@ -35,9 +37,8 @@ struct request_s {
 #define PASSWORD "test"
 
 static bool isrunning;
-
 static void *serve_client(void *arg);
-static request_s *request_s_(int fd);
+static request_s *request_s_(int fd, struct sockaddr_in *client_ip);
 static bool authenticate(request_s *req);
 
 void server_start(uint16_t port)
@@ -45,6 +46,8 @@ void server_start(uint16_t port)
     struct sockaddr_in sock_addr;
     
     log_info("Starting Server on port: %d.", port);
+    
+    signal(SIGPIPE, SIG_IGN);
     
     int sock_fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 
@@ -73,17 +76,30 @@ void server_start(uint16_t port)
     isrunning = true;
     
     log_info("Server is now listening on port: %d.", port);
-    
+
     while(isrunning) {
         request_s *req;
-        int client_fd = accept(sock_fd, NULL, NULL);
+        struct sockaddr_in client_ip;
+        socklen_t len = sizeof(client_ip);
+        int client_fd = accept(sock_fd, (struct sockaddr *)&client_ip, &len);
         
-        log_info("New Client Connected.");
-        
-        req = request_s_(client_fd);
-        status = pthread_create(&req->thread, NULL, serve_client, req);
+        req = request_s_(client_fd, &client_ip);
+
+        if(client_fd < 0) {
+            perror("Client failed on Connection Attempt");
+            log_error("Client [%s] experienced connection error.", req->ipstr);
+            free(req);
+        }
+        else {
+            log_info("Client [%s] Connected with socket descriptor: %d.", req->ipstr, client_fd);
+            
+
+            status = pthread_create(&req->thread, NULL, serve_client, req);
+            if(status < 0) {
+                log_error("Failure to create thread for client [%s].", req->ipstr);
+            }
+        }
     }
-    
     close(sock_fd);
 }
 
@@ -93,7 +109,11 @@ void *serve_client(void *arg)
     request_s *req = arg;
     struct pollfd fdstr;
     
-    if(!authenticate(req)) {
+    
+    if(authenticate(req)) {
+        log_info("Client [%s] Successfully Authenticated.", req->ipstr);
+    }
+    else {
         goto exit;
     }
     
@@ -130,11 +150,14 @@ exit:
     pthread_exit(NULL);
 }
 
-request_s *request_s_(int fd)
+request_s *request_s_(int fd, struct sockaddr_in *client_ip)
 {
+    int ip = client_ip->sin_addr.s_addr;
     request_s *req = del_alloc(sizeof *req);
     req->fd = fd;
     req->isactive = true;
+    req->client_ip = *client_ip;
+    inet_ntop(AF_INET, &ip, req->ipstr, INET_ADDRSTRLEN);
     return req;
 }
 
@@ -144,10 +167,10 @@ bool authenticate(request_s *req)
     static const char message[] =
     "/----------------------------------/\n"
     "/--------AUTHENTICATE BITCH--------/\n"
-    "/----------------------------------/\n"
+    "/----------------------------------/\a\n>"
     ;
     
-    static const char fail[] = "/-------------FAIL!!!--------------/\n";
+    static const char fail[] = "/-------------FAIL!!!--------------/\a\n";
     
     static const char success[] = "success.";
     int i;
@@ -167,11 +190,12 @@ bool authenticate(request_s *req)
     buf[status - 2] = '\0';
     
     if(strcmp(PASSWORD, buf)) {
-        log_warn("Failed Authentication Attempt Ocurred.");
+        log_warn("Failed Authentication Attempt Ocurred from client: [%s]", req->ipstr);
         for(i = 0; i < NFAILS; i++) {
             status = write(req->fd, fail, sizeof(fail));
             if(status < 0) {
-                log_error("Failed to send authentication failure message.");
+                log_warn("Failed to send authentication failure message - Probably Broken Pipe.");
+                break;
             }
         }
         return false;
@@ -185,4 +209,6 @@ bool authenticate(request_s *req)
         return true;
     }
 }
+
+
 
