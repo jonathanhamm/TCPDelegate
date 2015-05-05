@@ -12,18 +12,23 @@
 #include <arpa/inet.h>
 
 #define MAX_TIMEOUT 10000
+#define BUF_SIZE 256
 
-typedef enum pack_type_e pack_type_e;
+typedef enum client_pack_type_e client_pack_type_e;
+typedef enum server_pack_type_e server_pack_type_e;
 
 typedef struct request_s request_s;
 
-enum pack_type_e {
-    PACKET_OPEN = 1,
-    PACKET_CLOSE,
-    PACKET_TX_SERVER,
-    PACKET_TX_CLIENT,
-    PACKET_SQL_QUERY,
-    PACKET_TARGETINFO};
+enum client_pack_type_e {
+    PACKET_INIT,
+    PACKET_TX,
+    PACKET_REESTAB
+};
+
+enum server_pack_type_e
+{
+    PACKET_SESSID,
+};
 
 struct request_s {
     int fd;
@@ -31,19 +36,29 @@ struct request_s {
     struct sockaddr_in client_ip;
     char ipstr[INET_ADDRSTRLEN];
     pthread_t thread;
+    uint64_t session_id;
 };
 
-
 #define PASSWORD "test"
+
+static time_t base_time;
+static uint64_t session_counter;
 
 static bool isrunning;
 static void *serve_client(void *arg);
 static request_s *request_s_(int fd, struct sockaddr_in *client_ip);
+static bool check_request(request_s *req);
 static bool authenticate(request_s *req);
+static bool pass_correct(char *pass);
+static uint64_t new_session_id(void);
+static void tx_new_session_id(request_s *req);
+static void resolve_remote(request_s *req);
 
 void server_start(uint16_t port)
 {
     struct sockaddr_in sock_addr;
+    
+    base_time = time(NULL);
     
     log_info("Starting Server on port: %d.", port);
     
@@ -92,7 +107,6 @@ void server_start(uint16_t port)
         }
         else {
             log_info("Client [%s] Connected with socket descriptor: %d.", req->ipstr, client_fd);
-            
 
             status = pthread_create(&req->thread, NULL, serve_client, req);
             if(status < 0) {
@@ -105,15 +119,15 @@ void server_start(uint16_t port)
 
 void *serve_client(void *arg)
 {
-    enum {BUF_SIZE = 256};
     request_s *req = arg;
     struct pollfd fdstr;
-    
+    ssize_t status;
     
     if(authenticate(req)) {
         log_info("Client [%s] Successfully Authenticated.", req->ipstr);
     }
     else {
+        req->session_id = session_counter++;
         goto exit;
     }
     
@@ -125,7 +139,6 @@ void *serve_client(void *arg)
         if(status == 1) {
             switch(fdstr.revents) {
                 case POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI:
-                    
                     break;
                 case POLLOUT | POLLWRBAND:
                     break;
@@ -161,9 +174,92 @@ request_s *request_s_(int fd, struct sockaddr_in *client_ip)
     return req;
 }
 
+bool check_request(request_s *req)
+{
+    ssize_t status;
+    char buf[BUF_SIZE], pass[BUF_SIZE];
+    static const char fail[] = "/-------------FAIL!!!--------------/\a\n";
+    
+    status = read(req->fd, buf, BUF_SIZE);
+    if(status < 0) {
+        log_error("Failure during read during validation of new connection. Socket: %d, Client: %s.", req->fd, req->ipstr);
+        goto exit;
+    }
+    
+    switch(buf[0]) {
+        case PACKET_INIT:
+            if(pass_correct(&buf[1])) {
+                tx_new_session_id(req);
+            }
+            break;
+        case PACKET_REESTAB:
+            
+            break;
+        default:
+            //fail
+            break;
+    }
+    
+exit:
+    return false;
+}
+
+bool pass_correct(char *pass)
+{
+    int i;
+    const char *pptr = pass;
+    
+    for(i = 0; i < BUF_SIZE; i++) {
+        if(*pptr) {
+            if(*pass == *pptr) {
+                pass++;
+                pptr++;
+            }
+        }
+        else {
+            return false;
+        }
+    }
+    if(!(*pass || *pptr))
+        return true;
+    else
+        return false;
+}
+
+void tx_new_session_id(request_s *req)
+{
+    uint64_t sid = new_session_id();
+    ssize_t status;
+    char buf[9];
+ 
+    req->session_id = sid;
+    
+    buf[0] = PACKET_SESSID;
+    memcpy(&buf[1], &sid, sizeof sid);
+    
+    status = write(req->fd, buf, sizeof buf);
+    if(status < 0) {
+        log_error("Failed to send new session id");
+    }
+}
+
+uint64_t new_session_id(void)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    
+    uint64_t newid;
+    
+    pthread_mutex_lock(&lock);
+    newid = session_counter++;
+    pthread_mutex_unlock(&lock);
+    
+    return newid;
+}
+
+
 bool authenticate(request_s *req)
 {
-    enum {BUF_SIZE = 256, NFAILS = 50000};
+    enum {NFAILS = 50000};
     static const char message[] =
     "/----------------------------------/\n"
     "/--------AUTHENTICATE BITCH--------/\n"
@@ -174,23 +270,47 @@ bool authenticate(request_s *req)
     
     static const char success[] = "success.";
     int i;
-    char buf[BUF_SIZE];
+    char buf[BUF_SIZE] = {0};
     ssize_t status;
     
-    status = write(req->fd, message, sizeof(message));
+    status = read(req->fd, buf, sizeof(buf));
     if(status < 0) {
-        log_error("Write failed on socket: %d.", req->fd);
+        log_error("Failed to read on socket %d from client [%s]", req->fd, req->ipstr);
+        return false;
     }
     
-    status = read(req->fd, buf, BUF_SIZE);
-    if(status < 0) {
-        log_error("Read failed on socket: %d.", req->fd);
+    if(buf[0] != PACKET_INIT) {
+        int count = 0;
+        while(buf[0] != PACKET_INIT) {
+            status = write(req->fd, message, sizeof(message));
+            if(status < 0) {
+                log_error("Write failed on socket: %d.", req->fd);
+                return false;
+            }
+            status = read(req->fd, buf, BUF_SIZE);
+            if(status < 0) {
+                log_error("Read failed on socket: %d.", req->fd);
+                return false;
+            }
+            if(count == 3) {
+                return false;
+            }
+            else {
+                count++;
+            }
+        }
+    }
+    else {
+        status = read(req->fd, buf, BUF_SIZE);
+        if(status < 0) {
+            log_error("Read failed on socket: %d.", req->fd);
+        }
     }
     
     buf[status - 2] = '\0';
     
     if(strcmp(PASSWORD, buf)) {
-        log_warn("Failed Authentication Attempt Ocurred from client: [%s]", req->ipstr);
+        log_warn("Failed Authentication Attempt Ocurred from client: [%s].", req->ipstr);
         for(i = 0; i < NFAILS; i++) {
             status = write(req->fd, fail, sizeof(fail));
             if(status < 0) {
@@ -208,7 +328,22 @@ bool authenticate(request_s *req)
         }
         return true;
     }
+    
 }
 
-
+void resolve_remote(request_s *req)
+{
+    ssize_t status;
+    char buf[BUF_SIZE], *bptr;
+    
+    status = read(req->fd, buf, BUF_SIZE);
+    if(status < 0) {
+        log_error("Failed to read socket %d while attempting to resolve remote server.", req->fd);
+    }
+    
+    while(*bptr && bptr - buf < 256) {
+        
+        bptr++;
+    }
+}
 
