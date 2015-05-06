@@ -226,6 +226,7 @@ void log_task_consume(void)
     if(logger.running) {
         qptr--;
         fputs(qptr->str.data, logger.files[qptr->task]);
+        fflush(logger.files[qptr->task]);
         buf_destroy(&qptr->str);
         pthread_cond_signal(&queue_fullcond);
     }

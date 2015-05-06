@@ -11,23 +11,20 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+
 #define MAX_TIMEOUT 10000
 #define BUF_SIZE 256
+#define TABLE_SIZE 19
 
 typedef enum client_pack_type_e client_pack_type_e;
-typedef enum server_pack_type_e server_pack_type_e;
 
 typedef struct request_s request_s;
 
 enum client_pack_type_e {
-    PACKET_INIT,
+    PACKET_INIT = 1,
     PACKET_TX,
-    PACKET_REESTAB
-};
-
-enum server_pack_type_e
-{
-    PACKET_SESSID,
+    PACKET_REESTAB,
+    PACKET_SESSIONID
 };
 
 struct request_s {
@@ -37,12 +34,17 @@ struct request_s {
     char ipstr[INET_ADDRSTRLEN];
     pthread_t thread;
     uint64_t session_id;
+    int nchildren;
+    request_s *children[TABLE_SIZE];
 };
 
 #define PASSWORD "test"
 
 static time_t base_time;
 static uint64_t session_counter;
+
+static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
+static request_s *reqtable[TABLE_SIZE];
 
 static bool isrunning;
 static void *serve_client(void *arg);
@@ -53,6 +55,12 @@ static bool pass_correct(char *pass);
 static uint64_t new_session_id(void);
 static void tx_new_session_id(request_s *req);
 static void resolve_remote(request_s *req);
+
+static void table_insert_request(request_s *req);
+static void table_insert_request_(request_s *req, request_s *base[]);
+static void table_delete_request(request_s *req);
+static void table_delete_request_(request_s *req, request_s *base[]);
+static void reparent(request_s *root);
 
 void server_start(uint16_t port)
 {
@@ -123,11 +131,7 @@ void *serve_client(void *arg)
     struct pollfd fdstr;
     ssize_t status;
     
-    if(authenticate(req)) {
-        log_info("Client [%s] Successfully Authenticated.", req->ipstr);
-    }
-    else {
-        req->session_id = session_counter++;
+    if(!check_request(req)) {
         goto exit;
     }
     
@@ -165,11 +169,15 @@ exit:
 
 request_s *request_s_(int fd, struct sockaddr_in *client_ip)
 {
-    int ip = client_ip->sin_addr.s_addr;
+    int ip = client_ip->sin_addr.s_addr, i;
     request_s *req = del_alloc(sizeof *req);
     req->fd = fd;
     req->isactive = true;
     req->client_ip = *client_ip;
+    
+    for(i = 0; i < TABLE_SIZE; i++)
+        req->children[i] = NULL;
+    
     inet_ntop(AF_INET, &ip, req->ipstr, INET_ADDRSTRLEN);
     return req;
 }
@@ -186,10 +194,18 @@ bool check_request(request_s *req)
         goto exit;
     }
     
+    buf[BUF_SIZE - 1] = '\0';
+    
     switch(buf[0]) {
         case PACKET_INIT:
+            log_info("Testing: %s", &buf[1]);
             if(pass_correct(&buf[1])) {
+                log_info("Login Success for [%s]", req->ipstr);
                 tx_new_session_id(req);
+                table_insert_request(req);
+            }
+            else {
+                log_warn("Login Attempt failed for [%s]", req->ipstr);
             }
             break;
         case PACKET_REESTAB:
@@ -201,13 +217,14 @@ bool check_request(request_s *req)
     }
     
 exit:
+    //possible clean up code here(?)
     return false;
 }
 
 bool pass_correct(char *pass)
 {
     int i;
-    const char *pptr = pass;
+    const char *pptr = PASSWORD;
     
     for(i = 0; i < BUF_SIZE; i++) {
         if(*pptr) {
@@ -217,7 +234,7 @@ bool pass_correct(char *pass)
             }
         }
         else {
-            return false;
+            break;
         }
     }
     if(!(*pass || *pptr))
@@ -234,7 +251,7 @@ void tx_new_session_id(request_s *req)
  
     req->session_id = sid;
     
-    buf[0] = PACKET_SESSID;
+    buf[0] = PACKET_SESSIONID;
     memcpy(&buf[1], &sid, sizeof sid);
     
     status = write(req->fd, buf, sizeof buf);
@@ -259,7 +276,7 @@ uint64_t new_session_id(void)
 
 bool authenticate(request_s *req)
 {
-    enum {NFAILS = 50000};
+    enum {NFAILS = 50000, NINITS = 3};
     static const char message[] =
     "/----------------------------------/\n"
     "/--------AUTHENTICATE BITCH--------/\n"
@@ -274,6 +291,7 @@ bool authenticate(request_s *req)
     ssize_t status;
     
     status = read(req->fd, buf, sizeof(buf));
+    log_info("Read %lu bytes", (unsigned long)status);
     if(status < 0) {
         log_error("Failed to read on socket %d from client [%s]", req->fd, req->ipstr);
         return false;
@@ -282,6 +300,7 @@ bool authenticate(request_s *req)
     if(buf[0] != PACKET_INIT) {
         int count = 0;
         while(buf[0] != PACKET_INIT) {
+            log_info("val: %d\n", buf[0]);
             status = write(req->fd, message, sizeof(message));
             if(status < 0) {
                 log_error("Write failed on socket: %d.", req->fd);
@@ -292,24 +311,23 @@ bool authenticate(request_s *req)
                 log_error("Read failed on socket: %d.", req->fd);
                 return false;
             }
-            if(count == 3) {
+            if(count == NINITS) {
+                log_warn("Attempts Exhausted on socket %d for [%s]", req->fd, req->ipstr);
                 return false;
             }
             else {
                 count++;
+                memset(buf, 0, sizeof(buf));
             }
         }
-    }
-    else {
-        status = read(req->fd, buf, BUF_SIZE);
-        if(status < 0) {
-            log_error("Read failed on socket: %d.", req->fd);
-        }
+        log_info("GOT PACKET_INIT!");
     }
     
-    buf[status - 2] = '\0';
+    buf[BUF_SIZE - 1] = '\0';
     
-    if(strcmp(PASSWORD, buf)) {
+    log_info("Testing Password: %s", &buf[1]);
+    
+    if(strcmp(PASSWORD, &buf[1])) {
         log_warn("Failed Authentication Attempt Ocurred from client: [%s].", req->ipstr);
         for(i = 0; i < NFAILS; i++) {
             status = write(req->fd, fail, sizeof(fail));
@@ -342,8 +360,75 @@ void resolve_remote(request_s *req)
     }
     
     while(*bptr && bptr - buf < 256) {
-        
         bptr++;
     }
 }
 
+
+void table_insert_request(request_s *req)
+{
+    pthread_mutex_lock(&table_lock);
+    table_insert_request_(req, reqtable);
+    pthread_mutex_unlock(&table_lock);
+}
+
+void table_insert_request_(request_s *req, request_s *base[])
+{
+    request_s **prec =  &base[req->session_id % TABLE_SIZE],
+                        *rec = *prec;
+    
+    if(rec) {
+        if(req->session_id == rec->session_id) {
+            log_error("Duplicate session_id detected. Illegal State.");
+        }
+        else {
+            table_insert_request_(req, rec->children);
+        }
+    }
+    else {
+        *prec = rec;
+    }
+}
+
+
+void table_delete_request(request_s *req)
+{
+    pthread_mutex_lock(&table_lock);
+    table_delete_request_(req, reqtable);
+    pthread_mutex_unlock(&table_lock);
+}
+
+void table_delete_request_(request_s *req, request_s *base[])
+{
+    int i;
+    request_s **prec =  &base[req->session_id % TABLE_SIZE],
+                        *rec = *prec;
+
+    if(rec) {
+        if(rec->session_id == req->session_id) {
+            for(i = 0; i < TABLE_SIZE; i++) {
+                if(rec->children[i]) {
+                    reparent(rec->children[i]);
+                }
+            }
+            free(rec);
+            *prec = NULL;
+        }
+        else {
+            table_delete_request_(req, rec->children);
+        }
+    }
+}
+
+void reparent(request_s *root)
+{
+    int i;
+    
+    for(i = 0; i < TABLE_SIZE; i++) {
+        if(root->children[i]) {
+            reparent(root->children[i]);
+        }
+        root->children[i] = NULL;
+    }
+    table_insert_request(root);
+}

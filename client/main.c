@@ -12,7 +12,7 @@
 #define PASS "test"
 
 enum client_pack_type_e {
-    PACKET_INIT,
+    PACKET_INIT = 1,
     PACKET_TX,
     PACKET_REESTAB
 };
@@ -57,7 +57,7 @@ void init_write(int fd, const char *pass)
 {
     char buf[128];
     
-    buf[0] = htons(PACKET_INIT);
+    buf[0] = PACKET_INIT;
     strcpy(&buf[1], pass);
     
     write(fd, buf, strlen(buf) + 1);
