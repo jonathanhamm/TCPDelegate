@@ -4,6 +4,7 @@
 #include <string.h>
 
 #define MAX_QUEUE_SIZE 64
+#define TQ(p) ((p) % MAX_QUEUE_SIZE)
 
 typedef enum task_e task_e;
 typedef struct log_s log_s;
@@ -35,7 +36,8 @@ struct task_node_s {
 #define LOG_ERROR LOG_DIRECTORY "/error.log"
 
 static log_s logger = {.status_lock = PTHREAD_MUTEX_INITIALIZER};
-static task_node_s logqueue[MAX_QUEUE_SIZE], *qptr = logqueue;
+static unsigned qfpos, qbpos;
+static task_node_s logqueue[MAX_QUEUE_SIZE];
 static pthread_mutex_t queuelock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_fullcond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_emptycond = PTHREAD_COND_INITIALIZER;
@@ -141,10 +143,13 @@ void log_error(const char *format, ...)
 
 void log_flush(void)
 {
+    task_node_s *qptr;
+    
     do {
         pthread_mutex_lock(&queuelock);
-        while(qptr != logqueue) {
-            qptr--;
+        while(TQ(qfpos) != TQ(qbpos)) {
+            qfpos = TQ(qfpos + 1);
+            qptr = &logqueue[qfpos];
             fputs(qptr->str.data, logger.files[qptr->task]);
             buf_destroy(&qptr->str);
         }
@@ -201,33 +206,40 @@ void *log_loop(void *arg)
 
 void log_enqueue(buf_s str, task_e task)
 {
+    task_node_s *qptr;
+
     pthread_mutex_lock(&queuelock);
-    if(qptr == &logqueue[MAX_QUEUE_SIZE - 1]) {
+    if(TQ(qbpos + 1) == TQ(qfpos)) {
         overflow++;
-        while(qptr == &logqueue[MAX_QUEUE_SIZE - 1]) {
+        while(TQ(qbpos + 1) == TQ(qfpos)) {
             pthread_cond_wait(&queue_fullcond, &queuelock);
         }
         overflow--;
     }
-    *qptr++ = (task_node_s) {
+    qptr = &logqueue[qbpos];
+    *qptr = (task_node_s) {
         .str = str,
         .task = task
     };
+    qbpos = TQ(qbpos + 1);
     pthread_cond_signal(&queue_emptycond);
     pthread_mutex_unlock(&queuelock);
 }
 
 void log_task_consume(void)
 {
+    task_node_s *qptr;
+    
     pthread_mutex_lock(&queuelock);
-    while(qptr == logqueue && logger.running) {
+    while(TQ(qbpos) == TQ(qfpos) && logger.running) {
         pthread_cond_wait(&queue_emptycond, &queuelock);
     }
     if(logger.running) {
-        qptr--;
+        qptr = &logqueue[TQ(qfpos)];
         fputs(qptr->str.data, logger.files[qptr->task]);
         fflush(logger.files[qptr->task]);
         buf_destroy(&qptr->str);
+        qfpos = TQ(qfpos + 1);
         pthread_cond_signal(&queue_fullcond);
     }
     pthread_mutex_unlock(&queuelock);
